@@ -1,0 +1,15 @@
+#!/bin/sh -l
+
+#SBATCH --job-name test_vasp
+#SBATCH -A dmr180040
+#SBATCH -p wholenode
+#SBATCH --nodes=1
+#SBATCH --ntasks-per-node=128
+#SBATCH --export=ALL
+#SBATCH --time=12:00:00
+
+module --force purge # Unload all loaded modules and reset everything to original state.
+module load intel  intel-mkl openmpi
+
+python vasp.py -f libs/POSCARs-A4-diamond > log-vasp
+echo "JOB is complete"

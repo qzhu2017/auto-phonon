@@ -1,7 +1,7 @@
 from pymatgen.core.structure import Structure
-from vasprun.vasprun import vasprun
+from vasprun import vasprun
 import numpy as np
-from optparse import OptionParser
+import argparse
 from pymatgen.io.vasp.inputs import Poscar
 from pymatgen.symmetry.analyzer import SpacegroupAnalyzer
 from ase import Atoms
@@ -9,6 +9,7 @@ from ase.io import read
 from ase.calculators.vasp import Vasp
 import os, time
 import warnings
+import phonopy
 warnings.filterwarnings("ignore")
 
 def Read_POSCARS(filename):
@@ -27,13 +28,13 @@ def Read_POSCARS(filename):
         POSCAR_content.append(tmp)
         if len(POSCAR_content) == 1:
             print(tmp)
-            ids.append(tmp.split('|')[0])
+            ids.append(tmp.split('|')[0].rstrip())
         elif len(POSCAR_content) == 7:
             N_atom = sum(int(f) for f in str1.split())
         elif len(POSCAR_content) == 8+N_atom:
             pos_str = ''.join(POSCAR_content)
             try:
-                p = Poscar.from_string(pos_str)
+                p = Poscar.from_str(pos_str)
                 Struc.append(p.structure)
             except:
                 print('strucuture is wrong', pos_str)
@@ -88,7 +89,7 @@ def prepare_vasp(struc, gap=0):
 scripts to perform structure conformation
 """
 def pymatgen2ase(struc):
-    atoms = Atoms(symbols = struc.atomic_numbers, cell = struc.lattice.matrix)
+    atoms = Atoms(symbols = struc.atomic_numbers, cell = struc.lattice.matrix, pbc=True)
     atoms.set_scaled_positions(struc.frac_coords)
     return atoms
 
@@ -195,64 +196,66 @@ def single_optimize(struc, level, encut=None, mode='C'):
     struc.set_chemical_symbols(symbols_new)
     return struc, energy, time
 
-parser = OptionParser()
-parser.add_option("-f",  "--file", dest="posfile",
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Generative Models.")
+    parser.add_argument("-f",  "--file", dest="posfile",
                   help="by filename in POSCAR format")
-(options, args) = parser.parse_args()
+    args = parser.parse_args()
 
-strucs, ids = Read_POSCARS(options.posfile)
-cwd = os.getcwd()
-cmd = '/public/software/openmpi-1.8.8/Install/bin/mpirun -np 16 /public/sourcecode/vasp.5.4.4/vasp.5.4.4/bin/vasp_std '
+    strucs, ids = Read_POSCARS(args.posfile)#; print(ids); import sys; sys.exit()
+    cwd = os.getcwd()
 
-for mid, struc_pmg in zip(ids, strucs):
-    formula = struc_pmg.composition.get_reduced_formula_and_factor()[0]
-    dir0 = mid
-    if not os.path.exists(dir0):
-        os.makedirs(dir0)
-    os.chdir(dir0)
-    print(dir0)
-    if os.path.exists('FORCE_CONSTANTS'): # and not os.path.exists('band.png'):
-        import phonopy
-        struc = read('POSCAR-unitcell', format='vasp')
-        finder = SpacegroupAnalyzer(ase2pymatgen(struc))
-        spg = finder.get_space_group_symbol()[0]
-        if spg == 'P':
-            spg = 'auto'
-        with open('phonopy.conf', 'r') as f:
-            lines = f.readlines()
-            for line in lines:
-                if line.find('DIM') > -1:
-                    tmp = line.split('=')[-1]
-                    matrix=[eval(i) for i in tmp.split()]
-                    if len(matrix) == 3:
-                        supercell_matrix = np.diag(matrix)
-                    elif len(matrix) == 9:
-                        supercell_matrix = np.array(matrix).reshape([3,3])
-                    break
-        try: 
-            phonon = phonopy.load(unitcell_filename = "POSCAR-unitcell",
+    # Setup VASP here
+    VASP_CMD = '/home/x-qiangz/Github/VASP/vasp.5.4.4.pl2/bin/vasp_std > log'
+    cmd = 'srun -n $SLURM_NTASKS --mpi=pmi2 ' + VASP_CMD
+    os.environ['ASE_VASP_COMMAND'] = cmd
+    os.environ['VASP_PP_PATH'] = '/home/x-qiangz/Github/VASP'
+
+    for mid, struc_pmg in zip(ids, strucs):
+        formula = struc_pmg.composition.get_reduced_formula_and_factor()[0]
+        dir0 = mid
+        os.makedirs(dir0, exist_ok=True)
+        os.chdir(dir0)
+        print(dir0)
+        if os.path.exists('FORCE_CONSTANTS'): # and not os.path.exists('band.png'):
+            struc = read('POSCAR-unitcell', format='vasp')
+            finder = SpacegroupAnalyzer(ase2pymatgen(struc))
+            spg = finder.get_space_group_symbol()[0]
+            if spg == 'P': spg = 'auto'
+            with open('phonopy.conf', 'r') as f:
+                lines = f.readlines()
+                for line in lines:
+                    if line.find('DIM') > -1:
+                        tmp = line.split('=')[-1]
+                        matrix=[eval(i) for i in tmp.split()]
+                        if len(matrix) == 3:
+                            supercell_matrix = np.diag(matrix)
+                        elif len(matrix) == 9:
+                            supercell_matrix = np.array(matrix).reshape([3,3])
+                        break
+            try:
+                phonon = phonopy.load(unitcell_filename = "POSCAR-unitcell",
                                   force_constants_filename = "FORCE_CONSTANTS",
                                   supercell_matrix = supercell_matrix,
                                   primitive_matrix= spg,
                                   )
-            phonon.run_mesh(mesh=[10,10,10])
-            phonon.run_total_dos()
-            phonon.plot_total_DOS().savefig('dos.png')
-            phonon.auto_band_structure(plot=True).savefig('band.png')
-            mesh_dict = phonon.get_mesh_dict()
-            frequencies = mesh_dict['frequencies']  
-            freqs = frequencies.ravel()
-            if len(freqs[freqs<-2e-2])>0:
-                print('IMAGINARY FREQUENCY exists in ', dir0, formula)
-                with open('IMAGINARY_FREQUENCY', 'w') as f:
-                    f.write('IMAGINARY FREQUENCY exists {:s} {:s}\n'.format(dir0, formula))
-        except RuntimeError:
-            print('RuntimeError: Dynamical matrix has not yet built ', dir0, formula)
+                phonon.run_mesh(mesh=[10,10,10])
+                phonon.run_total_dos()
+                phonon.plot_total_DOS().savefig('dos.png')
+                phonon.auto_band_structure(plot=True).savefig('band.png')
+                mesh_dict = phonon.get_mesh_dict()
+                frequencies = mesh_dict['frequencies']
+                freqs = frequencies.ravel()
+                if len(freqs[freqs<-2e-2])>0:
+                    print('IMAGINARY FREQUENCY exists in ', dir0, formula)
+                    with open('IMAGINARY_FREQUENCY', 'w') as f:
+                        f.write('IMAGINARY FREQUENCY exists {:s} {:s}\n'.format(dir0, formula))
+            except RuntimeError:
+                print('RuntimeError: Dynamical matrix has not yet built ', dir0, formula)
 
-    else:
-        struc_ase = pymatgen2ase(struc_pmg)
-        #struc = sort(struc_ase)
-        try:
+        else:
+            struc_ase = pymatgen2ase(struc_pmg)
+            #struc = sort(struc_ase)
             error = False
             try:
                 struc, energy, time = single_optimize(struc_ase, 1)
@@ -292,7 +295,7 @@ for mid, struc_pmg in zip(ids, strucs):
                 dim = str(d1) + ' ' + str(d2) + ' ' + str(d3)
                 os.system('phonopy -d --dim="'+ dim +'" -c POSCAR-unitcell')
                 with open('phonopy.conf', 'w') as f:
-                    #So far, we consider only F, I, R, P
+                    # Needs to check if A/B/C are correct
                     f.write('DIM = {:d} 0 0 0 {:d} 0 0 0 {:d}\n'.format(d1, d2, d3))
                     if spg[0] == 'F':
                         f.write('PRIMITIVE_AXIS = 0 1/2 1/2 1/2 0 1/2 1/2 1/2 0\n')
@@ -300,10 +303,16 @@ for mid, struc_pmg in zip(ids, strucs):
                         f.write('PRIMITIVE_AXIS = -1/2 1/2 1/2 1/2 -1/2 1/2 1/2 1/2 -1/2\n')
                     elif spg[0] == 'R':
                         f.write('PRIMITIVE_AXIS = 2/3 -1/3 -1/3 1/3 1/3 -2/3 1/3 1/3 1/3\n')
+                    elif spg[0] == 'A':
+                        f.write('PRIMITIVE_AXIS = 1 0 0 0 1/2 1/2 0 1/2 -1/2\n')
+                    elif spg[0] == 'B':
+                        f.write('PRIMITIVE_AXIS = 1/2 0 1/2 0 1 0 1/2 0 -1/2\n')
+                    elif spg[0] == 'C':
+                        f.write('PRIMITIVE_AXIS = 1/2 1/2 0 1/2 -1/2 0 0 0 1\n')
                     elif spg[0] == 'P':
                         f.write('PRIMITIVE_AXIS = 1 0 0 0 1 0 0 0 1\n')
                     else:
-                        f.write(spg)
+                        raise ValueError("Unknow Braivis lattice")
 
                 os.system('cp SPOSCAR POSCAR')
                 struc = read('POSCAR', format='vasp')
@@ -311,6 +320,4 @@ for mid, struc_pmg in zip(ids, strucs):
                 os.system(cmd)
                 os.system('phonopy --fc vasprun.xml')
                 os.system('rm POSCAR CONTCAR POSCAR-0* CHG* DOSCAR EIGENVAL IBZKPT OSZICAR PCDAT REPORT WAVECAR XDATCAR ase-sort.dat')
-        except RuntimeError:
-            print('No pseudopotential ', formula)
-    os.chdir(cwd)
+        os.chdir(cwd)
